@@ -366,10 +366,202 @@ async function jolts() {
     }];
 }
 
+/* ------------------------------------------------------------------ *
+ * Census Business Trends and Outlook Survey: AI adoption.
+ *
+ * This one is not BLS and does not use the flat files. It moved here from
+ * the reader's browser for two reasons.
+ *
+ * 1. The Data Room panel was making 27 requests per reader, one per sector
+ *    and size class, because the only endpoint carrying every stratum is
+ *    the whole-period dump and that decodes to about 10MB.
+ * 2. The NATIONAL figure - the share of all US businesses using AI - exists
+ *    ONLY inside that 10MB dump. There is no cheap endpoint for it; I probed
+ *    /national, /us, /total, /all and naics2/00 and every one returns a bad
+ *    request. So the panel could never show the headline number and led with
+ *    the spread between industries instead.
+ *
+ * A runner downloading 10MB once a fortnight is nothing, so both problems
+ * disappear at once. This is incremental: it reads the file it wrote last
+ * time and only fetches periods it has never seen, which on most days is
+ * none at all.
+ *
+ * THE WORDING TRAP. Census changed the question in late 2025 from "in
+ * producing goods or services" to "in any of its business functions", and
+ * period 96 reverts to the old wording for one fortnight in the middle of
+ * the new run. The values either side look perfectly continuous, so nothing
+ * about the numbers reveals it. Every period therefore records which
+ * question it answered, and anything drawing a trend must filter on that.
+ * ------------------------------------------------------------------ */
+
+const BTOS_API = 'https://www.census.gov/hfp/btos/api/';
+const BTOS_MAX_NEW = 30;
+
+const BTOS_SECTORS = {
+    '11': 'Agriculture, forestry and fishing',
+    '21': 'Mining, quarrying, oil and gas',
+    '22': 'Utilities',
+    '23': 'Construction',
+    '31': 'Manufacturing',
+    '42': 'Wholesale trade',
+    '44': 'Retail trade',
+    '48': 'Transportation and warehousing',
+    '51': 'Information',
+    '52': 'Finance and insurance',
+    '53': 'Real estate and rental',
+    '54': 'Professional, scientific and technical',
+    '55': 'Management of companies',
+    '56': 'Administrative and waste services',
+    '61': 'Educational services',
+    '62': 'Health care and social assistance',
+    '71': 'Arts, entertainment and recreation',
+    '72': 'Accommodation and food services',
+    '81': 'Other services'
+};
+
+const BTOS_SIZES = {
+    A: '1 to 4 staff', B: '5 to 9', C: '10 to 19', D: '20 to 49',
+    E: '50 to 99', F: '100 to 249', G: '250 or more'
+};
+
+const rowsOf = j => (Array.isArray(j) ? j : Object.values(j || {}));
+const blank = v => v === null || v === undefined || v === '';
+
+async function getJson(url) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            const r = await fetch(url, { headers: HEADERS });
+            if (!r.ok) { throw new Error('HTTP ' + r.status); }
+            return await r.json();
+        } catch (e) {
+            if (attempt === 3) { throw new Error(url.slice(-40) + ': ' + e.message); }
+            await new Promise(r => setTimeout(r, attempt * 3000));
+        }
+    }
+}
+
+/* "6/29/2026 - 7/12/2026" -> the end of the collection window, as a date
+   we can compare and sort on. The period list runs a year into the future,
+   because it is a survey calendar rather than a list of published data. */
+function btosWindowEnd(name) {
+    const half = String(name || '').split(/\s+-\s+/)[1];
+    if (!half) { return null; }
+    const p = half.split('/');
+    if (p.length !== 3) { return null; }
+    return Date.UTC(+p[2], +p[0] - 1, +p[1]);
+}
+const iso = ms => new Date(ms).toISOString().slice(0, 10);
+
+function btosExtract(rows) {
+    const ai = rows.filter(r => r.OPTION_TEXT === 'AI current' && r.ANSWER === 'Yes');
+    if (!ai.length) { return null; }
+
+    const nat = ai.filter(r => blank(r.STATE) && blank(r.NAICS2) &&
+        blank(r.MSA) && blank(r.NAICS3) && blank(r.EMPSIZE))[0];
+    if (!nat) { return null; }
+
+    const pick = (rowsIn, key, names) => rowsIn
+        .filter(r => !blank(r[key]) && blank(r.STATE) && blank(r.MSA) &&
+            blank(r.NAICS3) && (key === 'EMPSIZE' ? blank(r.NAICS2) : blank(r.EMPSIZE)))
+        .map(r => ({
+            code: String(r[key]),
+            label: names[String(r[key])],
+            value: parseFloat(r.ESTIMATE_PERCENTAGE)
+        }))
+        .filter(x => x.label && !Number.isNaN(x.value));
+
+    return {
+        range: nat.DATE_RANGE || '',
+        national: parseFloat(nat.ESTIMATE_PERCENTAGE),
+        /* Read the wording back off the row rather than assuming it from the
+           date. Period 96 is why. */
+        modern: /business function/i.test(nat.QUESTION || ''),
+        sectors: pick(ai, 'NAICS2', BTOS_SECTORS),
+        sizes: pick(ai, 'EMPSIZE', BTOS_SIZES)
+    };
+}
+
+async function btos() {
+    let prior = { series: [], skipped: [] };
+    try {
+        const old = JSON.parse(fs.readFileSync(path.join(OUT, 'btos.json'), 'utf8'));
+        prior = { series: old.series || [], skipped: old.skipped || [], latest: old.latest };
+    } catch (e) { /* first run, backfill everything */ }
+
+    const known = new Set(prior.series.map(p => p.period).concat(prior.skipped));
+
+    const calendar = rowsOf(await getJson(BTOS_API + 'periods'))
+        .map(p => ({ id: parseInt(p.PERIOD_ID, 10), end: btosWindowEnd(p.NAME) }))
+        .filter(p => !Number.isNaN(p.id) && p.end !== null && p.end <= Date.now())
+        .sort((a, b) => a.id - b.id);
+
+    if (!calendar.length) { throw new Error('BTOS period calendar is empty'); }
+
+    const wanted = calendar.filter(p => !known.has(p.id)).slice(-BTOS_MAX_NEW);
+
+    const series = prior.series.slice();
+    const skipped = prior.skipped.slice();
+    let latest = prior.latest;
+    let failures = 0;
+
+    for (const p of wanted) {
+        let got;
+        try {
+            got = btosExtract(rowsOf(await getJson(BTOS_API + 'periods/' + p.id + '/data')));
+        } catch (e) {
+            /* Census being down must not block the five BLS datasets, which is
+               why this does not throw. The consequence is a quietly frozen
+               panel, so it is logged and the reference date in status.json
+               makes the staleness visible from outside. */
+            console.log('  btos period %d failed: %s', p.id, e.message);
+            failures++;
+            continue;
+        }
+        if (!got) {
+            /* Periods 85 to 87 carry no AI question at all. Record them so
+               they are never requested again. */
+            skipped.push(p.id);
+            continue;
+        }
+        series.push({
+            period: p.id, end: iso(p.end), range: got.range,
+            national: got.national, modern: got.modern
+        });
+        latest = {
+            period: p.id, end: iso(p.end), range: got.range,
+            national: got.national, modern: got.modern,
+            sectors: got.sectors, sizes: got.sizes
+        };
+    }
+
+    series.sort((a, b) => a.period - b.period);
+    skipped.sort((a, b) => a - b);
+
+    if (!series.length || !latest) {
+        throw new Error('BTOS produced no usable period' +
+            (failures ? ' (' + failures + ' fetches failed)' : ''));
+    }
+
+    const modern = series.filter(p => p.modern);
+    if (!modern.length) { throw new Error('BTOS has no period on the current question wording'); }
+
+    return ['btos.json', {
+        source: 'US Census Bureau, Business Trends and Outlook Survey',
+        measure: 'Share of businesses that used AI in any business function in the last two weeks',
+        reference: latest.range,
+        pulled: TODAY,
+        note: 'Rebuilt by update.js from the BTOS API. Fortnightly. Incremental: only periods not already present are fetched.',
+        wording: 'Census changed this question in late 2025 from "in producing goods or services" to "in any of its business functions". Period 96 reverts to the old wording for one fortnight. Each entry records which question it answered; only plot entries with modern true.',
+        latest,
+        series,
+        skipped
+    }];
+}
+
 /* ------------------------------------------------------------------ */
 
 async function main() {
-    const jobs = [ecec, eci, industry, jolts, laus, stoppages];
+    const jobs = [btos, ecec, eci, industry, jolts, laus, stoppages];
     const results = [];
 
     for (const job of jobs) {
