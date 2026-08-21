@@ -205,14 +205,26 @@ const STATES = {
     '72': 'Puerto Rico'
 };
 
+/* LAUS series IDs are 20 characters and decompose as
+ *   LA + S (seasonally adjusted) + area code (15) + measure code (2)
+ * where the state area code is ST + fips + eleven zeros, and 03 is the
+ * unemployment rate. An earlier version built these two characters short,
+ * every state returned empty, and the job failed loudly on 21 Aug 2026.
+ * If you change this, check the result against the live file, not against
+ * a fixture generated from this same map. */
+const LAUS_ID = fips => 'LASST' + fips + '0000000000003';
+
 async function laus() {
-    const ids = Object.keys(STATES).map(f => 'LASST' + f + '00000000003');
+    const ids = Object.keys(STATES).map(LAUS_ID);
+    if (ids.some(id => id.length !== 20)) {
+        throw new Error('LAUS series IDs must be 20 characters, built ' + ids[0].length);
+    }
     const raw = extract(await get('/la/la.data.3.AllStatesS'), ids, MONTH, mKey);
 
     const rows = [];
     let reference = null;
     for (const fips of Object.keys(STATES)) {
-        const d = raw['LASST' + fips + '00000000003'];
+        const d = raw[LAUS_ID(fips)];
         const now = d[d.length - 1];
         const yr = d[d.length - 13] || null;
         reference = reference || now[0];
