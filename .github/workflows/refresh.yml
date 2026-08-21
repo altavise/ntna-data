@@ -1,0 +1,39 @@
+# Copy to .github/workflows/refresh.yml in the repo that hosts the data.
+name: Refresh Data Room datasets
+
+on:
+  schedule:
+    # 16:00 UTC daily = 10am Chicago in summer, 9am in winter.
+    # BLS releases at 08:30 and 10:00 Eastern. In winter 10:00 Eastern is
+    # 15:00 UTC, so 16:00 clears the day's releases year round and the Data
+    # Room carries the new figures the same morning they come out.
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Rebuild datasets
+        run: node update.js ./data
+
+      - name: Commit if anything moved
+        run: |
+          git config user.name "ntna-data-bot"
+          git config user.email "hello@notalentnoalpha.com"
+          git add data/
+          if git diff --staged --quiet; then
+            echo "No change, nothing to commit."
+          else
+            git commit -m "Data refresh $(date -u +%Y-%m-%d)"
+            git push
+          fi
