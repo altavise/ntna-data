@@ -26,14 +26,23 @@ jobs:
       - name: Rebuild datasets
         run: node update.js ./data
 
-      - name: Commit if anything moved
+      # data/status.json changes on every successful run, so there is a commit
+      # every day. That is deliberate: it is the heartbeat an outside watcher
+      # reads to tell a quiet day from a dead scheduler. The message
+      # distinguishes the two, so `git log` stays readable and
+      # `git log -- data/laus.json` still shows only real revisions.
+      - name: Commit
         run: |
           git config user.name "ntna-data-bot"
           git config user.email "hello@notalentnoalpha.com"
           git add data/
           if git diff --staged --quiet; then
-            echo "No change, nothing to commit."
-          else
-            git commit -m "Data refresh $(date -u +%Y-%m-%d)"
-            git push
+            echo "Nothing staged, not even the heartbeat. That should not happen."
+            exit 1
           fi
+          if git diff --staged --name-only | grep -qv 'data/status.json'; then
+            git commit -m "Data refresh $(date -u +%Y-%m-%d)"
+          else
+            git commit -m "Checked, no new figures $(date -u +%Y-%m-%d)"
+          fi
+          git push
