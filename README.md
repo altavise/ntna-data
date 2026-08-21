@@ -22,7 +22,7 @@ node update.js ./data
 ```
 
 Writes `ecec.json`, `eci.json`, `industry.json`, `jolts.json`, `laus.json`
-and `stoppages.json`.
+and `stoppages.json`, plus `status.json`.
 
 Requires Node 18 or newer (it uses the built-in `fetch`). No dependencies.
 
@@ -45,6 +45,13 @@ halfway through cannot leave the Data Room reading a mixed vintage.
 | `jolts.json` | Openings and turnover | Monthly |
 | `laus.json` | State labor markets | Monthly |
 | `stoppages.json` | Work stoppages | Monthly |
+| `status.json` | Nothing. Heartbeat only | Every run |
+
+`status.json` is a **heartbeat**, rewritten on every successful run whether or
+not a figure moved. Without it the repository looks identical whether the job
+ran or never fired, and a dead scheduler sends no failure email because there
+is no run. Anything watching this data should read `status.json` and treat a
+`ran_at` older than about a day as a stopped job.
 
 Two are quarterly, so most daily runs will report `unchanged`. That is expected
 and is not a failure. The script ignores its own `pulled` date when deciding
@@ -58,6 +65,10 @@ whether anything really moved, so it will not churn the files daily for nothing.
   what happened to work stoppages.
 - **BLS blocks requests without a descriptive User-Agent.** One is set in
   `HEADERS`; keep the contact address current.
+- **Never build a test fixture from the same constant the code uses.** The LAUS
+  fixture was generated from the same state-ID map as `update.js`, so it
+  validated a wrong assumption against itself and shipped series IDs that were
+  two characters short. Verify IDs against the live file, or by a real run.
 - **JOLTS series carry the rate/level in the last character**, not a separate
   field: `JOL` is openings as a level, `HIR`/`QUR`/`LDR` are rates. All four
   used here are seasonally adjusted (`jt.series` column `seasonal` = `S`).

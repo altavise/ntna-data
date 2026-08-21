@@ -36,6 +36,7 @@ const HEADERS = {
 
 const OUT = path.resolve(process.argv[2] || 'data');
 const TODAY = new Date().toISOString().slice(0, 10);
+const STATUS = 'status.json';
 
 /* ------------------------------------------------------------------ */
 
@@ -380,7 +381,8 @@ async function main() {
     // Nothing is written until every dataset has been built, so a failure
     // halfway through cannot leave the Data Room reading a mixed vintage.
     fs.mkdirSync(OUT, { recursive: true });
-    let changed = 0;
+    const moved = [];
+    const references = {};
     for (const [name, doc, ms] of results) {
         const file = path.join(OUT, name);
         const next = JSON.stringify(doc);
@@ -390,11 +392,28 @@ async function main() {
         // ignore the pulled date when deciding whether anything really moved
         const strip = s => s ? s.replace(/"pulled":"[^"]*",?/, '') : null;
         const same = strip(prev) === strip(next);
-        if (!same) { fs.writeFileSync(file, next); changed++; }
+        if (!same) { fs.writeFileSync(file, next); moved.push(name); }
+        references[name] = doc.reference;
         console.log('%s %s  reference %s  %dms', same ? 'unchanged' : 'UPDATED  ',
             name.padEnd(16), doc.reference, ms);
     }
-    console.log('\n%d of %d datasets changed', changed, results.length);
+
+    /* HEARTBEAT.
+       Most days no figure moves, so no dataset file changes and the repo
+       looks identical whether the job ran or never fired at all. That makes
+       a silently dead scheduler indistinguishable from a quiet week, and a
+       dead scheduler sends no failure email because there is no run.
+       So write a status file on EVERY successful run. It is the only thing
+       an outside watcher can read to tell "ran, nothing moved" from "did
+       not run", and its daily commit doubles as repository activity. */
+    fs.writeFileSync(path.join(OUT, STATUS), JSON.stringify({
+        ran_at: new Date().toISOString(),
+        changed: moved,
+        references,
+        note: 'Written by update.js on every successful run, whether or not any figure moved. If ran_at is more than about a day old the scheduled job has stopped.'
+    }));
+
+    console.log('\n%d of %d datasets changed', moved.length, results.length);
     process.exit(0);
 }
 
