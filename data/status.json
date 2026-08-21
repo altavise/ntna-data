@@ -1,0 +1,1 @@
+{"ran_at":"2026-08-21T17:32:43.254Z","changed":[],"references":{"ecec.json":"2026Q1","eci.json":"2026Q2","industry.json":"2026-07","jolts.json":"2026-06","laus.json":"2026-07","stoppages.json":"2026-07"},"note":"Written by update.js on every successful run, whether or not any figure moved. If ran_at is more than about a day old the scheduled job has stopped."}
