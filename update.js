@@ -501,8 +501,17 @@ async function btos() {
 
     const series = prior.series.slice();
     const skipped = prior.skipped.slice();
-    let latest = prior.latest;
     let failures = 0;
+
+    /* Full records, with sectors and sizes, for everything fetched this run.
+       The headline block is chosen from these AFTERWARDS, by period id. It used
+       to be assigned inside the loop, which made it whatever happened to be
+       fetched last. That was right by accident for months, because new periods
+       arrive in ascending order, until 22 Aug 2026 when Census backfilled
+       period 76 into its calendar. It was the only period this job had never
+       seen, so it was the only one fetched, and the home page spent a day
+       reporting June 2025 as current. Never derive "newest" from loop order. */
+    const fetched = [];
 
     for (const p of wanted) {
         let got;
@@ -527,23 +536,56 @@ async function btos() {
             period: p.id, end: iso(p.end), range: got.range,
             national: got.national, modern: got.modern
         });
-        latest = {
+        fetched.push({
             period: p.id, end: iso(p.end), range: got.range,
             national: got.national, modern: got.modern,
             sectors: got.sectors, sizes: got.sizes
-        };
+        });
     }
 
     series.sort((a, b) => a.period - b.period);
     skipped.sort((a, b) => a - b);
 
-    if (!series.length || !latest) {
+    if (!series.length) {
         throw new Error('BTOS produced no usable period' +
             (failures ? ' (' + failures + ' fetches failed)' : ''));
     }
 
     const modern = series.filter(p => p.modern);
     if (!modern.length) { throw new Error('BTOS has no period on the current question wording'); }
+
+    /* The headline block must describe the newest period on the CURRENT question
+       wording. An older period is never a candidate for it, however recently it
+       arrived, and neither is a newer one that reverted to the old wording the
+       way period 96 did. */
+    const newestModern = modern[modern.length - 1];
+    const candidates = fetched.concat(prior.latest ? [prior.latest] : [])
+        .filter(c => c && c.modern === true && Array.isArray(c.sectors) && c.sectors.length);
+    let latest = candidates.filter(c => c.period === newestModern.period)[0];
+
+    /* Self-heal. If the stored block is not the newest period we hold, this run
+       repairs it rather than waiting for the next fortnight to paper over it.
+       Costs one Census call, and only when something is already wrong. */
+    if (!latest) {
+        console.log('  btos headline is stale, refetching period %d', newestModern.period);
+        const got = btosExtract(rowsOf(await getJson(BTOS_API + 'periods/' + newestModern.period + '/data')));
+        if (got && got.sectors.length) {
+            latest = {
+                period: newestModern.period, end: newestModern.end, range: got.range,
+                national: got.national, modern: got.modern,
+                sectors: got.sectors, sizes: got.sizes
+            };
+        }
+    }
+
+    /* Fail loud rather than publish a headline that disagrees with the series
+       underneath it. A frozen panel is recoverable; a confidently wrong number
+       on the home page is the one thing this whole site cannot afford. */
+    if (!latest || latest.period !== newestModern.period) {
+        throw new Error('BTOS headline block does not match the newest period on the ' +
+            'current wording (have ' + (latest ? latest.period : 'none') +
+            ', need ' + newestModern.period + ')');
+    }
 
     return ['btos.json', {
         source: 'US Census Bureau, Business Trends and Outlook Survey',
