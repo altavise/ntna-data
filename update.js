@@ -397,6 +397,14 @@ async function jolts() {
 const BTOS_API = 'https://www.census.gov/hfp/btos/api/';
 const BTOS_MAX_NEW = 30;
 
+/* A period that returns no AI estimates is only PERMANENTLY written off once
+   its collection window has been closed this long. Inside that window, "no
+   rows yet" means Census has not published the estimates, which is a race
+   against our own schedule rather than a property of the data. Periods 107 and
+   108 were both blacklisted by exactly that race and sat wrongly skipped for
+   six weeks while the panel reported a stale 21.8%. */
+const BTOS_SKIP_AFTER_DAYS = 60;
+
 const BTOS_SECTORS = {
     '11': 'Agriculture, forestry and fishing',
     '21': 'Mining, quarrying, oil and gas',
@@ -488,7 +496,8 @@ async function btos() {
         prior = { series: old.series || [], skipped: old.skipped || [], latest: old.latest };
     } catch (e) { /* first run, backfill everything */ }
 
-    const known = new Set(prior.series.map(p => p.period).concat(prior.skipped));
+    const have = new Set(prior.series.map(p => p.period));
+    const skipSet = new Set(prior.skipped);
 
     const calendar = rowsOf(await getJson(BTOS_API + 'periods'))
         .map(p => ({ id: parseInt(p.PERIOD_ID, 10), end: btosWindowEnd(p.NAME) }))
@@ -497,10 +506,28 @@ async function btos() {
 
     if (!calendar.length) { throw new Error('BTOS period calendar is empty'); }
 
-    const wanted = calendar.filter(p => !known.has(p.id)).slice(-BTOS_MAX_NEW);
+    const graceCut = Date.now() - BTOS_SKIP_AFTER_DAYS * 86400000;
 
-    const series = prior.series.slice();
-    const skipped = prior.skipped.slice();
+    /* Never seen at all. */
+    const fresh = calendar.filter(p => !have.has(p.id) && !skipSet.has(p.id));
+
+    /* Skipped, but recently enough that the skip may have been a race. These
+       are retried EVERY run until either they yield an AI question or their
+       window ages past the grace period, at which point the write-off becomes
+       permanent and they stop costing a request. */
+    const reclaim = calendar.filter(p => skipSet.has(p.id) && p.end > graceCut);
+
+    if (reclaim.length) {
+        console.log('  btos retrying %d recently skipped period(s): %s',
+            reclaim.length, reclaim.map(p => p.id).join(', '));
+    }
+
+    /* Reclaims are NOT subject to the cap. Capping the combined list would let
+       a long backfill crowd out the very periods this fix exists to recover. */
+    const wanted = reclaim.concat(fresh.slice(-BTOS_MAX_NEW))
+        .sort((a, b) => a.id - b.id);
+
+    let series = prior.series.slice();
     let failures = 0;
 
     /* Full records, with sectors and sizes, for everything fetched this run.
@@ -527,11 +554,23 @@ async function btos() {
             continue;
         }
         if (!got) {
-            /* Periods 85 to 87 carry no AI question at all. Record them so
-               they are never requested again. */
-            skipped.push(p.id);
+            /* TWO DIFFERENT THINGS LOOK IDENTICAL HERE, and conflating them is
+               what broke this panel. Periods 85 to 87 genuinely carry no AI
+               question, and should never be requested again. A period whose
+               window closed days ago may simply not have its estimates out
+               yet. Only the former is written off; the latter is left out of
+               the skip list so the next run asks again. */
+            if (p.end <= graceCut) {
+                skipSet.add(p.id);
+                console.log('  btos period %d has no AI question, writing it off', p.id);
+            } else {
+                console.log('  btos period %d has no AI estimates yet, will retry', p.id);
+            }
             continue;
         }
+
+        /* It answered, so any earlier skip of it was wrong. */
+        skipSet.delete(p.id);
         series.push({
             period: p.id, end: iso(p.end), range: got.range,
             national: got.national, modern: got.modern
@@ -543,8 +582,15 @@ async function btos() {
         });
     }
 
-    series.sort((a, b) => a.period - b.period);
-    skipped.sort((a, b) => a - b);
+    /* A reclaimed period is pushed by this run while prior.series may already
+       hold it (belt and braces: a reclaim should only ever happen for a period
+       that is NOT in series, but the headline guard below compares against
+       series and must never see a duplicate). Newest write wins. */
+    const byPeriod = new Map();
+    for (const row of series) { byPeriod.set(row.period, row); }
+    series = [...byPeriod.values()].sort((a, b) => a.period - b.period);
+
+    const skipped = [...skipSet].sort((a, b) => a - b);
 
     if (!series.length) {
         throw new Error('BTOS produced no usable period' +
